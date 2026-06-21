@@ -40,7 +40,10 @@ export class InMemoryStorage implements DocStorage {
   }
 }
 
-const KEY_PREFIX = 'casual-sheets:room:';
+// Redis key namespace for persisted room Y.Doc bytes. Override per
+// deployment (CASUAL_REDIS_PREFIX) so multiple products sharing one
+// Redis don't collide — e.g. "casual-docs:room:" / "casual-sheets:room:".
+const KEY_PREFIX = process.env.CASUAL_REDIS_PREFIX ?? 'casual:room:';
 
 export class RedisStorage implements DocStorage {
   constructor(

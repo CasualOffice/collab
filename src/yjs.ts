@@ -55,7 +55,7 @@ export function attachHocuspocus(
   };
 
   const hocuspocus = new Hocuspocus({
-    name: 'casual-sheets',
+    name: 'casual-collab',
     async onLoadDocument({ documentName, document }) {
       // 1) If the room was pre-seeded via /api/rooms (xlsx upload path),
       //    apply that first.

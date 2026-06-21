@@ -118,7 +118,7 @@ if (servesWeb) {
   });
   app.log.info(`serving built web app from ${webDist}`);
 } else {
-  app.log.info(`web/dist not built — run 'pnpm --filter @sheet/web build' or use compose`);
+  app.log.info(`web/dist not built — running API/WS only (mount a built SPA at web/dist to serve one)`);
 }
 
 // Persistence backend created first so the room registry can use it
@@ -134,7 +134,7 @@ app.log.info(
 // above (rooms vs files). Drives the WOPI /wopi/files/:id routes and
 // the admin-panel storage page in v0.1.0.
 const host = await createHost();
-app.log.info(`workbook host: ${host.label}`);
+app.log.info(`file host: ${host.label}`);
 registerWopiRoutes(app, host);
 
 // Admin panel config + REST routes. The on-disk config (default
@@ -476,5 +476,5 @@ const shutdown = async () => {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-app.log.info(`sheet server listening on http://${HOST}:${PORT}`);
+app.log.info(`collab server listening on http://${HOST}:${PORT}`);
 app.log.info(`websocket sync on ws://${HOST}:${PORT}/yjs`);
