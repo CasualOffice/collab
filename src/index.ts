@@ -21,7 +21,7 @@ import { registerPersonalAuthRoutes } from './auth/personal-routes.js';
 import { registerPersonalProfileRoutes } from './auth/personal-profile-routes.js';
 import { registerPersonalFilesRoutes } from './files/personal-files-routes.js';
 import { registerPersonalSharesRoutes } from './files/personal-shares-routes.js';
-import { registerAiRoutes } from './ai.js';
+import { attachAiWs } from './ai.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -230,10 +230,6 @@ app.log.info(
   `room registry: max ${process.env.MAX_ROOMS ?? 256} concurrent, TTL ${process.env.ROOM_TTL_MIN ?? 60} min, upload ≤ ${MAX_UPLOAD_MB} MB`,
 );
 
-registerAiRoutes(app, {
-  rateLimitEnabled: RATE_LIMIT_ENABLED,
-  rateLimitPerMin: RATE_LIMIT_PER_MIN,
-});
 
 app.get('/health', async () => ({
   ok: true,
@@ -471,8 +467,12 @@ const hocus = attachHocuspocus(app.server, rooms, storage, '/yjs', {
     : null,
 });
 
+const closeAiWs = attachAiWs(app.server, '/api/ai');
+app.log.info(`AI WebSocket on ws://${HOST}:${PORT}/api/ai`);
+
 const shutdown = async () => {
   app.log.info('shutting down');
+  closeAiWs();
   await hocus.close();
   await storage.close();
   if (host.close) await host.close();
