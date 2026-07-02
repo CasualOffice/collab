@@ -1,35 +1,60 @@
 /*
  * Copyright (c) 2026 Casual Office. All rights reserved.
  *
- * POST /api/ai/chat — thin Anthropic proxy.
+ * POST /api/ai/chat — generic LLM proxy.
  *
- * Forwards a messages-API call to Anthropic and streams the response
- * back to the client. The client's tool loop continues to run in the
- * browser (DocsBridge); this endpoint only removes the need for every
- * user to paste an API key into the editor.
+ * Forwards the request body verbatim to whatever LLM endpoint the
+ * operator configures. The client (DocOpsPanel) constructs the correct
+ * request shape for its chosen provider; this endpoint only adds
+ * server-side auth and removes the need for users to manage keys.
  *
- * Auth: the endpoint is gated by the room auth rules. In personal mode
- * the caller must carry a valid session cookie (same as every other
- * /api/* route). In anonymous mode the endpoint is open, so only
- * deploy with ANTHROPIC_API_KEY set when you trust your network.
+ * Environment variables:
+ *   LLM_ENDPOINT        Full URL to POST to.
+ *                       Default: https://api.anthropic.com/v1/messages
+ *                       Examples:
+ *                         https://api.openai.com/v1/chat/completions
+ *                         http://localhost:11434/v1/chat/completions  (Ollama)
+ *                         https://api.groq.com/openai/v1/chat/completions
  *
- * The caller may pass their own `apiKey` in the request body as an
- * escape hatch (BYO-key mode). The server key takes precedence when
- * both are present so an unprivileged caller can't use the field to
- * exfiltrate the server key via a crafted upstream request.
+ *   LLM_API_KEY         Server-side key injected into every request.
+ *                       Falls back to ANTHROPIC_API_KEY for convenience.
+ *
+ *   LLM_API_KEY_HEADER  Header name for the key.
+ *                       Default: x-api-key  (Anthropic)
+ *                       Use: Authorization  (OpenAI / Ollama / Groq — value
+ *                       will be sent as "Bearer <key>")
+ *
+ *   LLM_EXTRA_HEADERS   JSON object of additional headers to inject.
+ *                       Example: {"anthropic-version":"2023-06-01"}
+ *
+ * BYO-key fallback: if no server key is configured, the caller may
+ * supply `apiKey` + optionally `apiKeyHeader` in the request body.
+ * The server key always takes precedence.
  */
 
 import type { FastifyInstance } from 'fastify';
 
 interface AiChatBody {
-  model?: string;
-  system?: string;
-  messages: unknown;
-  tools?: unknown;
-  max_tokens?: number;
-  /** Optional BYO API key — only used when no server key is configured. */
+  /** Full request body forwarded verbatim to the upstream LLM. */
+  [key: string]: unknown;
+  /** BYO key — only used when no server key is configured. */
   apiKey?: string;
+  /** BYO key header name — e.g. "Authorization". Ignored when server key is set. */
+  apiKeyHeader?: string;
 }
+
+// Read config once at module load so the hot path is just a lookup.
+const LLM_ENDPOINT =
+  process.env.LLM_ENDPOINT ?? 'https://api.anthropic.com/v1/messages';
+const SERVER_KEY = process.env.LLM_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? null;
+const KEY_HEADER = process.env.LLM_API_KEY_HEADER ?? 'x-api-key';
+const EXTRA_HEADERS: Record<string, string> = (() => {
+  try {
+    return JSON.parse(process.env.LLM_EXTRA_HEADERS ?? '{}');
+  } catch {
+    return {};
+  }
+})();
 
 export function registerAiRoutes(
   app: FastifyInstance,
@@ -43,43 +68,46 @@ export function registerAiRoutes(
         : {},
     },
     async (req, reply) => {
-      const body = req.body as AiChatBody;
+      const body = { ...(req.body as AiChatBody) };
 
-      // Server key wins; fall back to caller-supplied key (BYO mode).
-      const apiKey = process.env.ANTHROPIC_API_KEY ?? body.apiKey ?? null;
-      if (!apiKey) {
+      // Determine which key + header to use.
+      const key = SERVER_KEY ?? body.apiKey ?? null;
+      if (!key) {
         return reply.code(503).send({
           error: 'no_api_key',
-          hint: 'Set ANTHROPIC_API_KEY on the server or supply apiKey in the request body.',
+          hint: 'Set LLM_API_KEY on the server, or supply apiKey in the request body.',
         });
       }
+      const keyHeader = SERVER_KEY ? KEY_HEADER : (body.apiKeyHeader ?? KEY_HEADER);
 
-      const payload = {
-        model: body.model ?? 'claude-haiku-4-5-20251001',
-        max_tokens: body.max_tokens ?? 4096,
-        ...(body.system ? { system: body.system } : {}),
-        messages: body.messages,
-        ...(body.tools ? { tools: body.tools } : {}),
+      // Strip client-only fields before forwarding.
+      delete body.apiKey;
+      delete body.apiKeyHeader;
+
+      // Build auth header value. OpenAI / Ollama / Groq expect "Bearer <key>";
+      // Anthropic expects the raw key. Use "Bearer" when the header is Authorization.
+      const keyValue =
+        keyHeader.toLowerCase() === 'authorization' ? `Bearer ${key}` : key;
+
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+        [keyHeader]: keyValue,
+        ...EXTRA_HEADERS,
       };
 
       let upstream: Response;
       try {
-        upstream = await fetch('https://api.anthropic.com/v1/messages', {
+        upstream = await fetch(LLM_ENDPOINT, {
           method: 'POST',
-          headers: {
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify(payload),
+          headers,
+          body: JSON.stringify(body),
         });
       } catch (err) {
-        req.log.warn({ err }, 'docops: upstream Anthropic fetch failed');
+        req.log.warn({ err, endpoint: LLM_ENDPOINT }, 'docops: upstream LLM fetch failed');
         return reply.code(502).send({ error: 'upstream_error', detail: String(err) });
       }
 
-      // Forward the status + body verbatim — the client parses the
-      // Anthropic envelope directly, so no re-shaping needed.
+      // Forward status + body verbatim — the client owns response parsing.
       const data = await upstream.json();
       return reply.code(upstream.status).send(data);
     },
