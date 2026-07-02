@@ -1,87 +1,287 @@
 /*
- * Copyright (c) 2026 Casual Office. All rights reserved.
+ * AI WebSocket endpoint — DocOps LLM orchestration.
  *
- * POST /api/ai/chat — thin Anthropic proxy.
+ * The SERVER holds the full LLM tool loop. When the LLM requests a tool
+ * call the server sends it back down to the originating client over the
+ * same WebSocket; the client executes it via DocsBridge and returns the
+ * result. Other room members see only the resulting Yjs edits, never the
+ * orchestration traffic.
  *
- * Forwards a messages-API call to Anthropic and streams the response
- * back to the client. The client's tool loop continues to run in the
- * browser (DocsBridge); this endpoint only removes the need for every
- * user to paste an API key into the editor.
+ * Protocol (per-connection):
  *
- * Auth: the endpoint is gated by the room auth rules. In personal mode
- * the caller must carry a valid session cookie (same as every other
- * /api/* route). In anonymous mode the endpoint is open, so only
- * deploy with ANTHROPIC_API_KEY set when you trust your network.
+ *   Client → Server:
+ *     { type:'chat', model, max_tokens, system, messages, tools, apiKey? }
+ *     { type:'tool_result', id: string, result: unknown, error?: string }
  *
- * The caller may pass their own `apiKey` in the request body as an
- * escape hatch (BYO-key mode). The server key takes precedence when
- * both are present so an unprivileged caller can't use the field to
- * exfiltrate the server key via a crafted upstream request.
+ *   Server → Client:
+ *     { type:'tool_call', id: string, toolName: string, args: object }
+ *     { type:'text', text: string }
+ *     { type:'done', history: LlmMessage[] }
+ *     { type:'error', message: string }
+ *
+ * LLM configuration (env vars):
+ *   LLM_ENDPOINT        Full POST URL. Default: https://api.anthropic.com/v1/messages
+ *                       Examples: https://api.openai.com/v1/chat/completions
+ *                                 http://localhost:11434/v1/chat/completions (Ollama)
+ *   LLM_API_KEY         Server-side key. Falls back to ANTHROPIC_API_KEY.
+ *   LLM_API_KEY_HEADER  Header name. Default: x-api-key (Anthropic).
+ *                       Use: Authorization for OpenAI / Ollama / Groq.
+ *   LLM_EXTRA_HEADERS   JSON object of extra headers to inject.
  */
 
-import type { FastifyInstance } from 'fastify';
+import { WebSocketServer, type WebSocket } from 'ws';
+import type { IncomingMessage, Server } from 'node:http';
 
-interface AiChatBody {
-  model?: string;
-  system?: string;
-  messages: unknown;
-  tools?: unknown;
-  max_tokens?: number;
-  /** Optional BYO API key — only used when no server key is configured. */
+// ── LLM config (read once at startup) ─────────────────────────────────────
+
+const LLM_ENDPOINT = process.env.LLM_ENDPOINT ?? 'https://api.anthropic.com/v1/messages';
+const SERVER_KEY = process.env.LLM_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? null;
+const KEY_HEADER = process.env.LLM_API_KEY_HEADER ?? 'x-api-key';
+const EXTRA_HEADERS: Record<string, string> = (() => {
+  try {
+    return JSON.parse(process.env.LLM_EXTRA_HEADERS ?? '{}') as Record<string, string>;
+  } catch {
+    return {};
+  }
+})();
+
+const MAX_TOOL_ROUNDS = 12;
+
+// ── Wire types ────────────────────────────────────────────────────────────
+
+type LlmContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; tool_use_id: string; content: string };
+
+interface LlmMessage {
+  role: 'user' | 'assistant';
+  content: LlmContentBlock[] | string;
+}
+
+interface ChatInitMsg {
+  type: 'chat';
+  model: string;
+  max_tokens: number;
+  system: string;
+  messages: LlmMessage[];
+  tools: unknown;
   apiKey?: string;
 }
 
-export function registerAiRoutes(
-  app: FastifyInstance,
-  opts: { rateLimitEnabled: boolean; rateLimitPerMin: number },
-): void {
-  app.post<{ Body: AiChatBody }>(
-    '/api/ai/chat',
-    {
-      config: opts.rateLimitEnabled
-        ? { rateLimit: { max: opts.rateLimitPerMin, timeWindow: '1 minute' } }
-        : {},
-    },
-    async (req, reply) => {
-      const body = req.body as AiChatBody;
+interface LlmApiResponse {
+  content: LlmContentBlock[];
+  stop_reason: 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence';
+  error?: { message: string };
+}
 
-      // Server key wins; fall back to caller-supplied key (BYO mode).
-      const apiKey = process.env.ANTHROPIC_API_KEY ?? body.apiKey ?? null;
-      if (!apiKey) {
-        return reply.code(503).send({
-          error: 'no_api_key',
-          hint: 'Set ANTHROPIC_API_KEY on the server or supply apiKey in the request body.',
-        });
+// ── LLM HTTP call ──────────────────────────────────────────────────────────
+
+async function callLlm(opts: {
+  model: string;
+  max_tokens: number;
+  system: string;
+  messages: LlmMessage[];
+  tools: unknown;
+  key: string;
+}): Promise<{ ok: false; message: string } | { ok: true; data: LlmApiResponse }> {
+  const keyValue =
+    KEY_HEADER.toLowerCase() === 'authorization' ? `Bearer ${opts.key}` : opts.key;
+
+  let resp: Response;
+  try {
+    resp = await fetch(LLM_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        [KEY_HEADER]: keyValue,
+        ...EXTRA_HEADERS,
+      },
+      body: JSON.stringify({
+        model: opts.model,
+        max_tokens: opts.max_tokens,
+        system: opts.system,
+        messages: opts.messages,
+        tools: opts.tools,
+      }),
+    });
+  } catch (err) {
+    return { ok: false, message: `upstream fetch failed: ${String(err)}` };
+  }
+
+  let data: LlmApiResponse;
+  try {
+    data = (await resp.json()) as LlmApiResponse;
+  } catch {
+    return { ok: false, message: `upstream response not JSON (status ${resp.status})` };
+  }
+
+  if (!resp.ok) {
+    return { ok: false, message: data.error?.message ?? `upstream error ${resp.status}` };
+  }
+
+  return { ok: true, data };
+}
+
+// ── Connection handler ────────────────────────────────────────────────────
+
+function handleAiConnection(ws: WebSocket) {
+  // In-flight tool calls: tool_use id → resolver
+  const pendingToolResults = new Map<
+    string,
+    (result: unknown, error: string | undefined) => void
+  >();
+
+  ws.on('message', (raw) => {
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(raw.toString()) as Record<string, unknown>;
+    } catch {
+      wsSend(ws, { type: 'error', message: 'invalid JSON' });
+      ws.close();
+      return;
+    }
+
+    if (msg.type === 'chat') {
+      runLlmLoop(ws, msg as unknown as ChatInitMsg, pendingToolResults).catch((err) => {
+        try {
+          wsSend(ws, { type: 'error', message: String(err) });
+          ws.close();
+        } catch {
+          /* already closed */
+        }
+      });
+    } else if (msg.type === 'tool_result') {
+      const id = msg.id as string;
+      const resolve = pendingToolResults.get(id);
+      if (resolve) {
+        pendingToolResults.delete(id);
+        resolve(msg.result, msg.error as string | undefined);
       }
+    }
+  });
 
-      const payload = {
-        model: body.model ?? 'claude-haiku-4-5-20251001',
-        max_tokens: body.max_tokens ?? 4096,
-        ...(body.system ? { system: body.system } : {}),
-        messages: body.messages,
-        ...(body.tools ? { tools: body.tools } : {}),
-      };
+  ws.on('error', () => {
+    for (const [, resolve] of pendingToolResults) {
+      resolve(null, 'connection closed');
+    }
+    pendingToolResults.clear();
+  });
+}
 
-      let upstream: Response;
-      try {
-        upstream = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify(payload),
-        });
-      } catch (err) {
-        req.log.warn({ err }, 'docops: upstream Anthropic fetch failed');
-        return reply.code(502).send({ error: 'upstream_error', detail: String(err) });
+function wsSend(ws: WebSocket, payload: Record<string, unknown>) {
+  try {
+    ws.send(JSON.stringify(payload));
+  } catch {
+    /* ignore sends on a closing socket */
+  }
+}
+
+async function runLlmLoop(
+  ws: WebSocket,
+  init: ChatInitMsg,
+  pendingToolResults: Map<string, (result: unknown, error: string | undefined) => void>,
+): Promise<void> {
+  const key = SERVER_KEY ?? init.apiKey ?? null;
+  if (!key) {
+    wsSend(ws, { type: 'error', message: 'no_api_key' });
+    ws.close();
+    return;
+  }
+
+  let history: LlmMessage[] = [...init.messages];
+
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    if (ws.readyState !== ws.OPEN) break;
+
+    const result = await callLlm({
+      model: init.model,
+      max_tokens: init.max_tokens,
+      system: init.system,
+      messages: history,
+      tools: init.tools,
+      key,
+    });
+
+    if (!result.ok) {
+      wsSend(ws, { type: 'error', message: result.message });
+      ws.close();
+      return;
+    }
+
+    const { data } = result;
+    history = [...history, { role: 'assistant', content: data.content }];
+
+    // Stream text blocks to the client as they arrive
+    for (const block of data.content) {
+      if (block.type === 'text' && block.text.trim()) {
+        wsSend(ws, { type: 'text', text: block.text });
       }
+    }
 
-      // Forward the status + body verbatim — the client parses the
-      // Anthropic envelope directly, so no re-shaping needed.
-      const data = await upstream.json();
-      return reply.code(upstream.status).send(data);
-    },
-  );
+    if (data.stop_reason !== 'tool_use') break;
+
+    // Route every tool_use block back to the originating client and
+    // await the result before continuing the LLM loop.
+    const toolResultBlocks: LlmContentBlock[] = [];
+
+    for (const block of data.content) {
+      if (block.type !== 'tool_use') continue;
+
+      wsSend(ws, {
+        type: 'tool_call',
+        id: block.id,
+        toolName: block.name,
+        args: block.input ?? {},
+      });
+
+      const [toolResult, toolError] = await new Promise<[unknown, string | undefined]>(
+        (resolve) => {
+          pendingToolResults.set(block.id, (r, e) => resolve([r, e]));
+        },
+      );
+
+      toolResultBlocks.push({
+        type: 'tool_result',
+        tool_use_id: block.id,
+        content: toolError
+          ? JSON.stringify({ ok: false, code: 'TOOL_ERROR', message: toolError })
+          : JSON.stringify(toolResult),
+      });
+    }
+
+    history = [...history, { role: 'user', content: toolResultBlocks }];
+  }
+
+  // Send the complete updated history so the client can update its
+  // conversation state for subsequent turns.
+  wsSend(ws, { type: 'done', history });
+  ws.close();
+}
+
+// ── Attach ────────────────────────────────────────────────────────────────
+
+/**
+ * Attach the AI WebSocket handler to an existing Node http.Server.
+ * Must be called after the HTTP server has started listening.
+ * Returns a cleanup function.
+ */
+export function attachAiWs(httpServer: Server, pathPrefix = '/api/ai'): () => void {
+  const wss = new WebSocketServer({ noServer: true });
+
+  const onUpgrade = (
+    req: IncomingMessage,
+    socket: import('node:net').Socket,
+    head: Buffer,
+  ) => {
+    if (!(req.url ?? '/').startsWith(pathPrefix)) return;
+    wss.handleUpgrade(req, socket, head, (ws) => handleAiConnection(ws));
+  };
+
+  httpServer.on('upgrade', onUpgrade);
+
+  return () => {
+    httpServer.off('upgrade', onUpgrade);
+    wss.close();
+  };
 }
