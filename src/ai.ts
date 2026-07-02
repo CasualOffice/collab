@@ -69,6 +69,8 @@ interface ChatInitMsg {
   apiKey?: string;
   /** Hocuspocus room name — used to broadcast AI presence to collaborators. */
   roomName?: string;
+  /** Maximum tool-call rounds before the loop is stopped. Defaults to MAX_TOOL_ROUNDS. */
+  maxToolRounds?: number;
 }
 
 interface LlmApiResponse {
@@ -215,9 +217,15 @@ async function runLlmLoop(
 
   broadcastAiStatus(docs, init.roomName, 'thinking');
 
-  let history: LlmMessage[] = [...init.messages];
+  const maxRounds =
+    typeof init.maxToolRounds === 'number' && init.maxToolRounds > 0
+      ? Math.min(init.maxToolRounds, MAX_TOOL_ROUNDS)
+      : MAX_TOOL_ROUNDS;
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+  let history: LlmMessage[] = [...init.messages];
+  let capHit = false;
+
+  for (let round = 0; round < maxRounds; round++) {
     if (ws.readyState !== ws.OPEN) break;
 
     const result = await callLlm({
@@ -278,12 +286,16 @@ async function runLlmLoop(
     }
 
     history = [...history, { role: 'user', content: toolResultBlocks }];
+
+    if (round === maxRounds - 1) {
+      capHit = true;
+    }
   }
 
   broadcastAiStatus(docs, init.roomName, 'idle');
   // Send the complete updated history so the client can update its
   // conversation state for subsequent turns.
-  wsSend(ws, { type: 'done', history });
+  wsSend(ws, { type: 'done', history, ...(capHit ? { capHit: true } : {}) });
   ws.close();
 }
 
