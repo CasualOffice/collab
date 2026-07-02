@@ -67,6 +67,8 @@ interface ChatInitMsg {
   messages: LlmMessage[];
   tools: unknown;
   apiKey?: string;
+  /** Hocuspocus room name — used to broadcast AI presence to collaborators. */
+  roomName?: string;
 }
 
 interface LlmApiResponse {
@@ -125,7 +127,28 @@ async function callLlm(opts: {
 
 // ── Connection handler ────────────────────────────────────────────────────
 
-function handleAiConnection(ws: WebSocket) {
+// ── Presence helpers ─────────────────────────────────────────────────────────
+
+type HocuspocusDocuments = Map<string, { broadcastStateless(payload: string): void }>;
+
+function broadcastAiStatus(
+  docs: HocuspocusDocuments | null,
+  roomName: string | undefined,
+  status: 'thinking' | 'idle',
+) {
+  if (!docs || !roomName) return;
+  const doc = docs.get(roomName);
+  if (!doc) return;
+  try {
+    doc.broadcastStateless(JSON.stringify({ type: 'ai-status', status }));
+  } catch {
+    /* ignore — room may have drained between start and broadcast */
+  }
+}
+
+// ── Connection handler ────────────────────────────────────────────────────
+
+function handleAiConnection(ws: WebSocket, docs: HocuspocusDocuments | null) {
   // In-flight tool calls: tool_use id → resolver
   const pendingToolResults = new Map<
     string,
@@ -143,7 +166,7 @@ function handleAiConnection(ws: WebSocket) {
     }
 
     if (msg.type === 'chat') {
-      runLlmLoop(ws, msg as unknown as ChatInitMsg, pendingToolResults).catch((err) => {
+      runLlmLoop(ws, msg as unknown as ChatInitMsg, pendingToolResults, docs).catch((err) => {
         try {
           wsSend(ws, { type: 'error', message: String(err) });
           ws.close();
@@ -181,6 +204,7 @@ async function runLlmLoop(
   ws: WebSocket,
   init: ChatInitMsg,
   pendingToolResults: Map<string, (result: unknown, error: string | undefined) => void>,
+  docs: HocuspocusDocuments | null,
 ): Promise<void> {
   const key = SERVER_KEY ?? init.apiKey ?? null;
   if (!key) {
@@ -188,6 +212,8 @@ async function runLlmLoop(
     ws.close();
     return;
   }
+
+  broadcastAiStatus(docs, init.roomName, 'thinking');
 
   let history: LlmMessage[] = [...init.messages];
 
@@ -204,6 +230,7 @@ async function runLlmLoop(
     });
 
     if (!result.ok) {
+      broadcastAiStatus(docs, init.roomName, 'idle');
       wsSend(ws, { type: 'error', message: result.message });
       ws.close();
       return;
@@ -253,6 +280,7 @@ async function runLlmLoop(
     history = [...history, { role: 'user', content: toolResultBlocks }];
   }
 
+  broadcastAiStatus(docs, init.roomName, 'idle');
   // Send the complete updated history so the client can update its
   // conversation state for subsequent turns.
   wsSend(ws, { type: 'done', history });
@@ -265,8 +293,17 @@ async function runLlmLoop(
  * Attach the AI WebSocket handler to an existing Node http.Server.
  * Must be called after the HTTP server has started listening.
  * Returns a cleanup function.
+ *
+ * Pass the Hocuspocus `server.documents` map to enable AI presence
+ * broadcasting: when a chat session starts the server emits a stateless
+ * `{ type:'ai-status', status:'thinking' }` to all clients in the room,
+ * and `status:'idle'` when the loop finishes or errors.
  */
-export function attachAiWs(httpServer: Server, pathPrefix = '/api/ai'): () => void {
+export function attachAiWs(
+  httpServer: Server,
+  pathPrefix = '/api/ai',
+  hocuspocusDocs: HocuspocusDocuments | null = null,
+): () => void {
   const wss = new WebSocketServer({ noServer: true });
 
   const onUpgrade = (
@@ -275,7 +312,7 @@ export function attachAiWs(httpServer: Server, pathPrefix = '/api/ai'): () => vo
     head: Buffer,
   ) => {
     if (!(req.url ?? '/').startsWith(pathPrefix)) return;
-    wss.handleUpgrade(req, socket, head, (ws) => handleAiConnection(ws));
+    wss.handleUpgrade(req, socket, head, (ws) => handleAiConnection(ws, hocuspocusDocs));
   };
 
   httpServer.on('upgrade', onUpgrade);

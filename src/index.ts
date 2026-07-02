@@ -467,7 +467,7 @@ const hocus = attachHocuspocus(app.server, rooms, storage, '/yjs', {
     : null,
 });
 
-const closeAiWs = attachAiWs(app.server, '/api/ai');
+const closeAiWs = attachAiWs(app.server, '/api/ai', hocus.hocuspocus.documents as Parameters<typeof attachAiWs>[2]);
 app.log.info(`AI WebSocket on ws://${HOST}:${PORT}/api/ai`);
 
 const shutdown = async () => {
