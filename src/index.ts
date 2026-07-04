@@ -22,6 +22,7 @@ import { registerPersonalProfileRoutes } from './auth/personal-profile-routes.js
 import { registerPersonalFilesRoutes } from './files/personal-files-routes.js';
 import { registerPersonalSharesRoutes } from './files/personal-shares-routes.js';
 import { attachAiWs } from './ai.js';
+import { isZipContainer, isGzip } from './upload-validation.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -337,6 +338,12 @@ app.post<{ Params: { id: string } }>(
     const file = await req.file();
     if (!file) return reply.code(400).send({ error: 'no_file' });
     const buf = await file.toBuffer();
+    // Seeds are .xlsx workbooks — zip (OOXML) containers. Reject anything that
+    // isn't a zip so a client can't pin 100 MB of arbitrary bytes in room
+    // memory (MAX_ROOMS × MAX_UPLOAD_BYTES of unvalidated RSS otherwise).
+    if (!isZipContainer(buf)) {
+      return reply.code(415).send({ error: 'unsupported_media_type' });
+    }
     rooms.setXlsxSeed(req.params.id, new Uint8Array(buf));
     return { ok: true, bytes: buf.byteLength };
   },
@@ -412,6 +419,11 @@ app.post<{ Params: { id: string } }>(
     else if (body instanceof Uint8Array) bytes = body;
     if (!bytes || bytes.byteLength === 0) {
       return reply.code(400).send({ error: 'empty_body' });
+    }
+    // The snapshot is a gzipped IWorkbookData cache — reject non-gzip bytes so
+    // arbitrary uploads can't be pinned in room memory.
+    if (!isGzip(bytes)) {
+      return reply.code(415).send({ error: 'unsupported_media_type' });
     }
     rooms.setSnapshotGz(req.params.id, bytes);
     return { ok: true, bytes: bytes.byteLength };
