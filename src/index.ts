@@ -59,7 +59,25 @@ const app = Fastify({
   trustProxy: process.env.TRUST_PROXY === 'true',
 });
 
-await app.register(cors, { origin: true });
+// CORS. `CORS_ORIGINS` (comma-separated) restricts to an allowlist — set it in
+// production so a hostile page can't ride the user's cookies against /auth,
+// /files, etc. Unset keeps the reflect-any default for local dev; we warn if
+// that's left open under NODE_ENV=production.
+const corsOrigins = (process.env.CORS_ORIGINS ?? '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+if (corsOrigins.length > 0) {
+  await app.register(cors, { origin: corsOrigins, credentials: true });
+  app.log.info(`CORS: restricted to ${corsOrigins.join(', ')}`);
+} else {
+  if (process.env.NODE_ENV === 'production') {
+    app.log.warn(
+      'CORS: reflecting any Origin (no CORS_ORIGINS set) — set an allowlist in production',
+    );
+  }
+  await app.register(cors, { origin: true });
+}
 await app.register(multipart, { limits: { fileSize: MAX_UPLOAD_BYTES } });
 await app.register(cookie);
 
