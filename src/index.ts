@@ -46,7 +46,16 @@ const RATE_LIMIT_ENABLED = (process.env.RATE_LIMIT_ENABLED ?? 'true').toLowerCas
 const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN ?? 60);
 const UPLOAD_RATE_LIMIT_PER_MIN = Number(process.env.UPLOAD_RATE_LIMIT_PER_MIN ?? 12);
 
-const app = Fastify({ logger: true, bodyLimit: MAX_UPLOAD_BYTES });
+// Enable trustProxy behind a reverse proxy (Caddy / nginx / Cloudflare) so
+// `req.ip` — and therefore the per-IP rate-limit key below — is the real
+// client address, not the proxy's. Without it, every request behind the proxy
+// shares one bucket and a single abuser throttles everyone. Off by default so
+// a direct-exposed server can't be spoofed via X-Forwarded-For.
+const app = Fastify({
+  logger: true,
+  bodyLimit: MAX_UPLOAD_BYTES,
+  trustProxy: process.env.TRUST_PROXY === 'true',
+});
 
 await app.register(cors, { origin: true });
 await app.register(multipart, { limits: { fileSize: MAX_UPLOAD_BYTES } });
@@ -433,7 +442,13 @@ app.get<{ Params: { id: string } }>('/api/rooms/:id/snapshot', async (req, reply
 
 // Diagnostic: list current rooms (clients, idle time). No auth — fine
 // for v1 since the surface is anonymous and self-hosted anyway.
-app.get('/api/rooms', async () => ({ rooms: rooms.snapshot() }));
+// Public diagnostic: per-room counts WITHOUT the room ids. An open (no
+// password) room is readable by anyone who has its id, so listing every live
+// id unauthenticated handed out the full set of shared documents. The metadata
+// (client counts, age, protected flag) stays for a health overview.
+app.get('/api/rooms', async () => ({
+  rooms: rooms.snapshot().map(({ id: _id, ...rest }) => rest),
+}));
 
 // SPA fallback — any unknown HTML route serves index.html so client-side
 // routing (e.g. /r/:roomId) works on reload. Only registered when the
