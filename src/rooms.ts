@@ -3,7 +3,7 @@
  * across restarts. See docs/CO-EDITING.md §"Room lifecycle".
  */
 
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomInt, timingSafeEqual } from 'node:crypto';
 
 type RoomState = {
   id: string;
@@ -246,11 +246,13 @@ export class RoomRegistry {
 }
 
 /** Short room ids that are easy to share in a URL but unguessable enough
- *  for anonymous sessions. Base36, 12 chars ≈ 60 bits of entropy. */
+ *  for anonymous sessions. Base36, 12 chars ≈ 60 bits of entropy. Uses a
+ *  CSPRNG (`crypto.randomInt`) — an open room is readable by anyone with its
+ *  id, so a seed-predictable `Math.random()` would leak documents. */
 function makeRoomId(): string {
   let out = '';
   for (let i = 0; i < 12; i++) {
-    out += Math.floor(Math.random() * 36).toString(36);
+    out += randomInt(36).toString(36);
   }
   return out;
 }

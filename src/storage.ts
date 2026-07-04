@@ -81,7 +81,20 @@ export class RedisStorage implements DocStorage {
  */
 export async function createStorage(): Promise<DocStorage> {
   const url = process.env.REDIS_URL;
-  if (!url) return new InMemoryStorage();
+  if (!url) {
+    // In production, ephemeral Y.Doc storage means every restart drops all
+    // live rooms — almost never intended. Refuse to boot loudly unless the
+    // operator explicitly opts in, so a misconfigured deploy fails fast
+    // instead of silently losing data.
+    if (process.env.NODE_ENV === 'production' && process.env.ALLOW_EPHEMERAL !== 'true') {
+      throw new Error(
+        'Refusing to start: NODE_ENV=production with in-memory Y.Doc storage — ' +
+          'rooms would be lost on every restart. Set REDIS_URL for persistence, ' +
+          'or ALLOW_EPHEMERAL=true to override intentionally.',
+      );
+    }
+    return new InMemoryStorage();
+  }
   // Lazy import so the redis client only loads when actually used.
   const { default: Redis } = await import('ioredis');
   const redis = new Redis(url, {

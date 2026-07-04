@@ -36,22 +36,28 @@ export function attachHocuspocus(
   // Debounce per-room saves so a rapid burst of edits doesn't hammer Redis.
   // 500 ms feels right for "still feels live, doesn't write on every keystroke".
   const SAVE_DEBOUNCE_MS = 500;
-  const pendingSaves = new Map<string, ReturnType<typeof setTimeout>>();
+  // Each entry keeps its timer AND a `flush` closure that performs the save
+  // immediately — so shutdown (SIGTERM) can drain the queue instead of only
+  // cancelling it, which previously discarded the last <500 ms of edits per
+  // room on every deploy/restart.
+  const pendingSaves = new Map<
+    string,
+    { timer: ReturnType<typeof setTimeout>; flush: () => Promise<void> }
+  >();
   const queueSave = (name: string, doc: Y.Doc) => {
     const existing = pendingSaves.get(name);
-    if (existing) clearTimeout(existing);
-    pendingSaves.set(
-      name,
-      setTimeout(async () => {
-        pendingSaves.delete(name);
-        try {
-          const update = Y.encodeStateAsUpdate(doc);
-          await storage.save(name, update);
-        } catch (err) {
-          console.warn('[hocuspocus] save failed for', name, err);
-        }
-      }, SAVE_DEBOUNCE_MS),
-    );
+    if (existing) clearTimeout(existing.timer);
+    const flush = async () => {
+      pendingSaves.delete(name);
+      try {
+        const update = Y.encodeStateAsUpdate(doc);
+        await storage.save(name, update);
+      } catch (err) {
+        console.warn('[hocuspocus] save failed for', name, err);
+      }
+    };
+    const timer = setTimeout(flush, SAVE_DEBOUNCE_MS);
+    pendingSaves.set(name, { timer, flush });
   };
 
   const hocuspocus = new Hocuspocus({
@@ -132,8 +138,24 @@ export function attachHocuspocus(
     async onConnect({ documentName }) {
       rooms.onConnect(documentName);
     },
-    async onDisconnect({ documentName }) {
+    async onDisconnect({ documentName, document, clientsCount }) {
       rooms.onDisconnect(documentName);
+      // Snapshot-on-drain: when the last client leaves, run the room's pending
+      // debounced save now rather than risking the doc being unloaded before
+      // the 500 ms timer fires — otherwise the final edits are lost.
+      if (clientsCount === 0) {
+        const pending = pendingSaves.get(documentName);
+        if (pending) {
+          clearTimeout(pending.timer);
+          await pending.flush();
+        } else if (document) {
+          try {
+            await storage.save(documentName, Y.encodeStateAsUpdate(document as Y.Doc));
+          } catch (err) {
+            console.warn('[hocuspocus] drain save failed for', documentName, err);
+          }
+        }
+      }
     },
   });
 
@@ -195,9 +217,14 @@ export function attachHocuspocus(
   return {
     hocuspocus,
     close: async () => {
-      // Flush any pending debounced saves before we tear down.
-      for (const [, timer] of pendingSaves) clearTimeout(timer);
-      pendingSaves.clear();
+      // Drain any pending debounced saves before we tear down — run each save
+      // now instead of cancelling it, so the last <500 ms of edits per room
+      // survive a SIGTERM / deploy restart.
+      const flushes = [...pendingSaves.values()].map(({ timer, flush }) => {
+        clearTimeout(timer);
+        return flush();
+      });
+      await Promise.allSettled(flushes);
       httpServer.off('upgrade', onUpgrade);
       wss.close();
       await hocuspocus.destroy();
