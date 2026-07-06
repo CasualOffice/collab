@@ -20,6 +20,23 @@ export type AttachHocuspocusOptions = {
 };
 
 /**
+ * Anonymous (no share-token) join privilege gate.
+ *
+ * Hocuspocus's `connection.readOnly` flag is BINARY, so — mirroring the
+ * authoritative token path in `resolveJoinRole` (join-role.ts), where
+ * anything short of 'edit' collapses to read-only — ONLY an explicit
+ * write role grants edit access on the anonymous `?role=` path.
+ * Everything else is read-only: 'view', 'comment' (the share dialog
+ * hands out `?role=comment` links), and any unknown/absent value.
+ *
+ * Previously only 'view' was gated here, so a `?role=comment` link
+ * holder fell through to WRITE and could edit the document (security).
+ */
+export function anonymousJoinReadOnly(role: string | null | undefined): boolean {
+  return role !== 'edit' && role !== 'write';
+}
+
+/**
  * Wire Hocuspocus to a Node http server. Hocuspocus owns the Yjs sync
  * protocol; we hook lifecycle callbacks into our RoomRegistry (accounting)
  * and DocStorage (persistence). The room id is the document name — clients
@@ -123,14 +140,15 @@ export function attachHocuspocus(
         return { role: decision.role, via: 'share-token' as const };
       }
 
-      // ── No token → legacy anonymous path, unchanged. ────────────────
+      // ── No token → legacy anonymous path. ───────────────────────────
       const role = requestParameters.get('role');
-      if (role === 'view') {
+      const readOnly = anonymousJoinReadOnly(role);
+      if (readOnly) {
         connection.readOnly = true;
       }
       // Returned object becomes `context` on later hooks. Surface the
       // role so logs / metrics can attribute writes correctly.
-      return { role: role === 'view' ? 'view' : 'write' };
+      return { role: readOnly ? (role ?? 'view') : 'write' };
     },
     async onChange({ documentName, document }) {
       queueSave(documentName, document as Y.Doc);
