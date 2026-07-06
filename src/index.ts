@@ -23,6 +23,7 @@ import { registerPersonalFilesRoutes } from './files/personal-files-routes.js';
 import { registerPersonalSharesRoutes } from './files/personal-shares-routes.js';
 import { attachAiWs } from './ai.js';
 import { isZipContainer, isGzip } from './upload-validation.js';
+import { registerMcpProxyRoute } from './mcpProxy.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -165,6 +166,8 @@ app.log.info(
 const host = await createHost();
 app.log.info(`file host: ${host.label}`);
 registerWopiRoutes(app, host);
+// Same-origin proxy so the web editor can reach external MCP servers (CORS).
+registerMcpProxyRoute(app);
 
 // Admin panel config + REST routes. The on-disk config (default
 // `/data/casual-admin.json`) drives runtime customisation: branding,
