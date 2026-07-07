@@ -79,6 +79,12 @@ interface ChatInitMsg {
   apiKey?: string;
   /** Hocuspocus room name — used to broadcast AI presence to collaborators. */
   roomName?: string;
+  /**
+   * Display name of the user running AI — threaded into the ai-status
+   * broadcast so collaborators can see WHO is asking ("Alice is asking AI…").
+   * Omitted → the broadcast carries no identity (legacy behavior).
+   */
+  userName?: string;
   /** Maximum tool-call rounds before the loop is stopped. Defaults to MAX_TOOL_ROUNDS. */
   maxToolRounds?: number;
   /**
@@ -166,12 +172,22 @@ function broadcastAiStatus(
   docs: HocuspocusDocuments | null,
   roomName: string | undefined,
   status: "thinking" | "idle",
+  userName?: string,
 ) {
   if (!docs || !roomName) return;
   const doc = docs.get(roomName);
   if (!doc) return;
   try {
-    doc.broadcastStateless(JSON.stringify({ type: "ai-status", status }));
+    const payload: {
+      type: "ai-status";
+      status: "thinking" | "idle";
+      userName?: string;
+    } = {
+      type: "ai-status",
+      status,
+    };
+    if (userName) payload.userName = userName;
+    doc.broadcastStateless(JSON.stringify(payload));
   } catch {
     /* ignore — room may have drained between start and broadcast */
   }
@@ -258,7 +274,7 @@ async function runSingleRound(
     return;
   }
 
-  broadcastAiStatus(docs, init.roomName, "thinking");
+  broadcastAiStatus(docs, init.roomName, "thinking", init.userName);
   const result = await callLlm({
     model: init.model,
     max_tokens: init.max_tokens,
@@ -267,7 +283,7 @@ async function runSingleRound(
     tools: init.tools,
     key,
   });
-  broadcastAiStatus(docs, init.roomName, "idle");
+  broadcastAiStatus(docs, init.roomName, "idle", init.userName);
 
   if (!result.ok) {
     wsSend(ws, { type: "error", message: result.message });
@@ -307,7 +323,7 @@ async function runLlmLoop(
     return;
   }
 
-  broadcastAiStatus(docs, init.roomName, "thinking");
+  broadcastAiStatus(docs, init.roomName, "thinking", init.userName);
 
   const maxRounds =
     typeof init.maxToolRounds === "number" && init.maxToolRounds > 0
@@ -330,7 +346,7 @@ async function runLlmLoop(
     });
 
     if (!result.ok) {
-      broadcastAiStatus(docs, init.roomName, "idle");
+      broadcastAiStatus(docs, init.roomName, "idle", init.userName);
       wsSend(ws, { type: "error", message: result.message });
       ws.close();
       return;
@@ -388,7 +404,7 @@ async function runLlmLoop(
     }
   }
 
-  broadcastAiStatus(docs, init.roomName, "idle");
+  broadcastAiStatus(docs, init.roomName, "idle", init.userName);
   // Send the complete updated history so the client can update its
   // conversation state for subsequent turns.
   wsSend(ws, { type: "done", history, ...(capHit ? { capHit: true } : {}) });
